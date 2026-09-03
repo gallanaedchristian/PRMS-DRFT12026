@@ -1,0 +1,6 @@
+{
+  "name": "Patient Records Management System",
+  "description": "A modern 2026 SaaS healthcare electronic patient records management system with clinical drawing findings, medical history tracking, audit logs, and Supabase integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
