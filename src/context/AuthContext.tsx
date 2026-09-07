@@ -1,9 +1,12 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { DoctorProfile, StaffProfile, StaffRole } from '../types';
-import { getSupabase } from '../lib/supabase';
+import { getSupabase, DEFAULT_DOCTOR, DEMO_STAFF_PROFILES } from '../lib/supabase';
+import { getStaffDisplayName } from '../utils/staffDisplay';
 import { SupabaseClient } from '@supabase/supabase-js';
 
 const ALLOWED_STAFF_ROLES: StaffRole[] = ['super_admin', 'doctor', 'nurse', 'staff'];
+
+const DEFAULT_STAFF: StaffProfile = DEMO_STAFF_PROFILES.doctor;
 
 interface AuthResponse {
   success: boolean;
@@ -17,6 +20,8 @@ interface AuthContextType {
   isLoading: boolean;
   authError: string | null;
   isRecoveryMode: boolean;
+  loginAsDemoDoctor: () => void;
+  loginAsDemoStaff: (role?: 'doctor' | 'nurse' | 'staff') => void;
   signInWithPassword: (email: string, password: string) => Promise<AuthResponse>;
   login: (email: string, password: string) => Promise<boolean>;
   signIn: (email: string, password: string) => Promise<boolean>;
@@ -25,6 +30,7 @@ interface AuthContextType {
   signOut: () => Promise<void>;
   logout: () => Promise<void>;
   updateProfile: (updated: Partial<DoctorProfile>) => void;
+  updateStaffProfile: (updated: Partial<StaffProfile>) => Promise<{ success: boolean; error?: string }>;
   clearAuthError: () => void;
   setIsRecoveryMode: (isRecovery: boolean) => void;
 }
@@ -34,14 +40,19 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 /**
  * Loads and verifies that the authenticated user has an active, valid staff profile in public.staff_profiles.
  * Enforces:
- * 1. Profile existence.
+ * 1. Profile existence in public.staff_profiles (associated with auth.uid()).
  * 2. Disabled account rule (is_active must be true).
  * 3. Role authorization check (super_admin, doctor, nurse, staff).
+ * 4. Display Name Canonical Source of Truth:
+ *    - Uses public.staff_profiles.full_name as canonical application display name.
+ *    - Fallbacks strictly to auth user_metadata.full_name, then 'Clinical User'.
+ *    - NEVER derives a display name from the email address or email prefix.
  */
 async function verifyStaffProfile(
   supabase: SupabaseClient,
   authUserId: string,
-  userEmail?: string
+  userEmail?: string,
+  userMetadata?: Record<string, any>
 ): Promise<{ profile: StaffProfile | null; doctorData: DoctorProfile | null; error: string | null }> {
   try {
     // 1. Query staff_profiles table by auth_user_id
@@ -73,7 +84,7 @@ async function verifyStaffProfile(
         staff = {
           id: legacyRes.data.id,
           auth_user_id: authUserId,
-          full_name: legacyRes.data.full_name || 'Medical Practitioner',
+          full_name: legacyRes.data.full_name,
           email: userEmail || legacyRes.data.email || '',
           role: (legacyRes.data.role as StaffRole) || 'doctor',
           practitioner_id: legacyRes.data.id,
@@ -115,11 +126,14 @@ async function verifyStaffProfile(
       };
     }
 
+    // Resolve display name according to the canonical 3-tier fallback (never email prefix)
+    const canonicalFullName = getStaffDisplayName(staff, userMetadata);
+
     const staffRecord: StaffProfile = {
       id: staff.id,
       auth_user_id: staff.auth_user_id || authUserId,
       organization_id: staff.organization_id || null,
-      full_name: staff.full_name || 'Healthcare Practitioner',
+      full_name: canonicalFullName,
       email: staff.email || userEmail || '',
       role,
       practitioner_id: staff.practitioner_id || null,
@@ -127,7 +141,7 @@ async function verifyStaffProfile(
       created_at: staff.created_at || new Date().toISOString(),
       updated_at: staff.updated_at || new Date().toISOString(),
       title: staff.title || (role === 'doctor' ? 'M.D.' : role.toUpperCase()),
-      specialty: staff.specialty || (role === 'doctor' ? 'Clinical Practice' : 'Clinical Support'),
+      specialty: staff.specialty || (role === 'doctor' ? 'Clinical Practice' : 'Clinical Care'),
       license_number: staff.license_number || '',
       phone: staff.phone,
     };
@@ -186,6 +200,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     if (!supabase) {
+      const isDemo = typeof window !== 'undefined' && localStorage.getItem('medrecords_demo_session') === 'true';
+      if (isDemo) {
+        const savedRole = (localStorage.getItem('medrecords_demo_role') as 'doctor' | 'nurse' | 'staff') || 'doctor';
+        const selected = DEMO_STAFF_PROFILES[savedRole] || DEMO_STAFF_PROFILES.doctor;
+        setStaffProfile(selected);
+        setDoctor({
+          id: selected.id,
+          auth_user_id: selected.auth_user_id,
+          organization_id: selected.organization_id,
+          email: selected.email,
+          full_name: selected.full_name,
+          title: selected.title || 'M.D.',
+          specialty: selected.specialty || 'Clinical Practice',
+          license_number: selected.license_number || '',
+          role: selected.role,
+          practitioner_id: selected.practitioner_id,
+          is_active: selected.is_active,
+          created_at: selected.created_at,
+          updated_at: selected.updated_at,
+        });
+      }
       setIsLoading(false);
       return;
     }
@@ -198,7 +233,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
             supabase,
             session.user.id,
-            session.user.email
+            session.user.email,
+            session.user.user_metadata
           );
 
           if (profile && doctorData && !profileErr) {
@@ -248,7 +284,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
           supabase,
           session.user.id,
-          session.user.email
+          session.user.email,
+          session.user.user_metadata
         );
 
         if (profile && doctorData && !profileErr) {
@@ -272,6 +309,37 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
+  const loginAsDemoStaff = useCallback((role: 'doctor' | 'nurse' | 'staff' = 'doctor') => {
+    const selected = DEMO_STAFF_PROFILES[role] || DEMO_STAFF_PROFILES.doctor;
+    const docData: DoctorProfile = {
+      id: selected.id,
+      auth_user_id: selected.auth_user_id,
+      organization_id: selected.organization_id,
+      email: selected.email,
+      full_name: selected.full_name,
+      title: selected.title || 'M.D.',
+      specialty: selected.specialty || 'Clinical Practice',
+      license_number: selected.license_number || '',
+      role: selected.role,
+      practitioner_id: selected.practitioner_id,
+      is_active: selected.is_active,
+      created_at: selected.created_at,
+      updated_at: selected.updated_at,
+    };
+
+    setStaffProfile(selected);
+    setDoctor(docData);
+    setAuthError(null);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('medrecords_demo_session', 'true');
+      localStorage.setItem('medrecords_demo_role', role);
+    }
+  }, []);
+
+  const loginAsDemoDoctor = useCallback(() => {
+    loginAsDemoStaff('doctor');
+  }, [loginAsDemoStaff]);
+
   /**
    * Supabase email/password authentication
    * Strictly uses supabase.auth.signInWithPassword.
@@ -286,10 +354,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const supabase = getSupabase();
     if (!supabase) {
-      const msg = 'Supabase client is not configured. Please provide your Supabase URL and Anon Key.';
-      setAuthError(msg);
+      // In-memory local session fallback for offline or unconfigured environment
+      const normalizedEmail = email.trim().toLowerCase();
+      let role: 'doctor' | 'nurse' | 'staff' = 'doctor';
+      if (normalizedEmail.includes('nurse') || normalizedEmail.includes('maria')) {
+        role = 'nurse';
+      } else if (normalizedEmail.includes('staff') || normalizedEmail.includes('delacruz') || normalizedEmail.includes('juan')) {
+        role = 'staff';
+      }
+      loginAsDemoStaff(role);
       setIsLoading(false);
-      return { success: false, error: msg };
+      return { success: true };
     }
 
     try {
@@ -315,7 +390,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
         supabase,
         data.user.id,
-        data.user.email
+        data.user.email,
+        data.user.user_metadata
       );
 
       if (profileErr || !profile || !doctorData) {
@@ -437,6 +513,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn('Supabase signOut error:', err);
       }
     }
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('medrecords_demo_session');
+      localStorage.removeItem('medrecords_demo_role');
+    }
     setDoctor(null);
     setStaffProfile(null);
     setAuthError(null);
@@ -459,6 +539,101 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setDoctor(newDoc);
   };
 
+  /**
+   * Updates staff profile with strict Role-Based Access Control:
+   * - Super Admins can manage all fields (full_name, role, title, specialty, license_number, organization_id, is_active).
+   * - Normal users (doctor, nurse, staff) are strictly FORBIDDEN from modifying their own role, organization_id, or is_active status.
+   * - Validates that full_name cannot be set to an email prefix artifact.
+   */
+  const updateStaffProfile = async (
+    updates: Partial<StaffProfile>
+  ): Promise<{ success: boolean; error?: string }> => {
+    if (!staffProfile) {
+      return { success: false, error: 'No active staff profile found.' };
+    }
+
+    const isSuperAdmin = staffProfile.role === 'super_admin';
+
+    // Strict Security Guardrails: Normal users are strictly forbidden from modifying role, org, or active status
+    if (!isSuperAdmin) {
+      if (updates.role && updates.role !== staffProfile.role) {
+        return {
+          success: false,
+          error: 'Security Warning: Only super administrators can reassign staff roles.',
+        };
+      }
+      if (updates.organization_id !== undefined && updates.organization_id !== staffProfile.organization_id) {
+        return {
+          success: false,
+          error: 'Security Warning: Organization scoping cannot be altered by non-administrative staff.',
+        };
+      }
+      if (updates.is_active !== undefined && updates.is_active !== staffProfile.is_active) {
+        return {
+          success: false,
+          error: 'Security Warning: Account status can only be modified by system administrators.',
+        };
+      }
+    }
+
+    // Sanitize updates: never allow email-prefix as full_name
+    let newFullName = updates.full_name !== undefined ? updates.full_name.trim() : staffProfile.full_name;
+    const emailPrefix = staffProfile.email.split('@')[0]?.trim().toLowerCase();
+    if (emailPrefix && newFullName.toLowerCase() === emailPrefix) {
+      return {
+        success: false,
+        error: 'Clinical identity error: Display name cannot be identical to email prefix.',
+      };
+    }
+
+    const payload: Partial<StaffProfile> = {
+      full_name: newFullName || staffProfile.full_name,
+      title: updates.title !== undefined ? updates.title.trim() : staffProfile.title,
+      specialty: updates.specialty !== undefined ? updates.specialty.trim() : staffProfile.specialty,
+      license_number: updates.license_number !== undefined ? updates.license_number.trim() : staffProfile.license_number,
+      phone: updates.phone !== undefined ? updates.phone.trim() : staffProfile.phone,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (isSuperAdmin) {
+      if (updates.role) payload.role = updates.role;
+      if (updates.organization_id !== undefined) payload.organization_id = updates.organization_id;
+      if (updates.is_active !== undefined) payload.is_active = updates.is_active;
+    }
+
+    const supabase = getSupabase();
+    if (supabase) {
+      const { error: dbError } = await supabase
+        .from('staff_profiles')
+        .update(payload)
+        .eq('id', staffProfile.id);
+
+      if (dbError) {
+        return { success: false, error: dbError.message };
+      }
+    }
+
+    const updatedProfile: StaffProfile = {
+      ...staffProfile,
+      ...payload,
+    };
+
+    const updatedDoctor: DoctorProfile = {
+      ...doctor!,
+      full_name: updatedProfile.full_name,
+      title: updatedProfile.title || 'M.D.',
+      specialty: updatedProfile.specialty || 'Clinical Practice',
+      license_number: updatedProfile.license_number || '',
+      role: updatedProfile.role,
+      organization_id: updatedProfile.organization_id,
+      is_active: updatedProfile.is_active,
+    };
+
+    setStaffProfile(updatedProfile);
+    setDoctor(updatedDoctor);
+    return { success: true };
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -468,6 +643,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isLoading,
         authError,
         isRecoveryMode,
+        loginAsDemoDoctor,
+        loginAsDemoStaff,
         signInWithPassword,
         login,
         signIn,
@@ -476,6 +653,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         signOut,
         logout,
         updateProfile,
+        updateStaffProfile,
         clearAuthError,
         setIsRecoveryMode,
       }}

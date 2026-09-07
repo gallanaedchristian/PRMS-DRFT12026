@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { usePatients } from '../../context/PatientContext';
 import { useAuth } from '../../context/AuthContext';
+import { getStaffDisplayName } from '../../utils/staffDisplay';
 
 interface AppLayoutProps {
   children: React.ReactNode;
@@ -31,11 +32,16 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
   onOpenNewRecord,
 }) => {
   const { activeView, setActiveView, clinicInfo, syncStatus, searchQuery, setSearchQuery } = usePatients();
-  const { doctor, signOut } = useAuth();
+  const { doctor, staffProfile, signOut } = useAuth();
+  const displayName = getStaffDisplayName(staffProfile);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const navItems = [
-    { id: 'dashboard', label: 'Doctor Dashboard', icon: LayoutDashboard },
+    { 
+      id: 'dashboard', 
+      label: staffProfile?.role === 'nurse' ? 'Nurse Station' : staffProfile?.role === 'staff' ? 'Staff Dashboard' : 'Clinical Dashboard', 
+      icon: LayoutDashboard 
+    },
     { id: 'patients', label: 'Patient Records', icon: Users },
     { id: 'medical-records', label: 'Clinical Records', icon: FileText },
     { id: 'analytics', label: 'Practice Analytics', icon: BarChart3 },
@@ -158,24 +164,25 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
           </nav>
         </div>
 
-        {/* Sidebar Footer: Doctor Profile & Sign Out */}
+        {/* Sidebar Footer: Staff Profile & Sign Out */}
         <div className="p-4 border-t border-slate-800">
           <div className="flex items-center gap-3 p-2 rounded-xl bg-slate-800/60">
             <div className="w-9 h-9 rounded-full bg-blue-700 text-white font-bold text-xs flex items-center justify-center shrink-0">
-              {doctor?.full_name?.charAt(0) || 'D'}
+              {displayName.charAt(0) || 'C'}
             </div>
             <div className="overflow-hidden flex-1">
               <h4 className="text-xs font-bold text-white truncate">
-                {doctor?.full_name || 'Dr. Fausto Tancongco'}
+                {displayName}
               </h4>
-              <p className="text-[10px] text-slate-400 truncate">
-                {doctor?.specialty || 'Internal Medicine'}
+              <p className="text-[10px] text-slate-400 truncate capitalize">
+                {staffProfile?.role || 'Staff'}
+                {(staffProfile?.specialty || doctor?.specialty) && ` • ${staffProfile?.specialty || doctor?.specialty}`}
               </p>
             </div>
             <button
               type="button"
               onClick={signOut}
-              title="Sign Out / Switch Doctor"
+              title="Sign Out / Switch Staff Account"
               className="p-1 text-slate-400 hover:text-white rounded transition"
             >
               <LogOut className="w-4 h-4" />

@@ -84,7 +84,7 @@ export const PatientFormModal: React.FC<PatientFormModalProps> = ({
 
   const validate = (): boolean => {
     const errs: { [key: string]: string } = {};
-    if (!name.trim()) errs.name = 'Patient full name is required (e.g. Arceñas, Melanie)';
+    if (!name.trim()) errs.name = 'Patient full name is required (e.g. Dela Cruz, Juan)';
     if (!age || isNaN(Number(age)) || Number(age) < 0 || Number(age) > 130) {
       errs.age = 'Please enter a valid age between 0 and 130';
     }
@@ -248,7 +248,7 @@ export const PatientFormModal: React.FC<PatientFormModalProps> = ({
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g. Arceñas, Melanie"
+                  placeholder="e.g. Dela Cruz, Juan"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   className={`w-full text-sm rounded-lg border px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none ${
@@ -265,7 +265,7 @@ export const PatientFormModal: React.FC<PatientFormModalProps> = ({
                 </label>
                 <input
                   type="text"
-                  placeholder="Auto-generated (e.g. P-00175)"
+                  placeholder="Auto-generated (e.g. P-00001)"
                   value={patientNumber}
                   onChange={(e) => setPatientNumber(e.target.value)}
                   className="w-full text-sm rounded-lg border border-slate-300 px-3 py-2 bg-slate-50 focus:ring-2 focus:ring-blue-500 focus:outline-none"

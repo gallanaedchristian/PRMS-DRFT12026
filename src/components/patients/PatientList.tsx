@@ -140,7 +140,7 @@ export const PatientList: React.FC<PatientListProps> = ({
             <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder='Search by name (e.g. "melanie"), patient ID, or phone...'
+              placeholder="Search by patient name, ID #, or phone..."
               value={searchQuery}
               onChange={(e) => {
                 setSearchQuery(e.target.value);

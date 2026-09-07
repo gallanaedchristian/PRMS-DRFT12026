@@ -79,12 +79,21 @@ CREATE TABLE IF NOT EXISTS public.profiles (
 );
 
 -- ==============================================================================
+-- 4.b BASE TABLE: public.organization_patient_sequences (Atomic Organization Counter)
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS public.organization_patient_sequences (
+    organization_id UUID PRIMARY KEY REFERENCES public.organizations(id) ON DELETE CASCADE,
+    last_val BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- ==============================================================================
 -- 5. BASE TABLE: public.patients
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS public.patients (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID REFERENCES public.organizations(id) ON DELETE SET NULL,
-    patient_number TEXT UNIQUE NOT NULL,
+    patient_number TEXT NOT NULL,
     name TEXT NOT NULL,
     age INTEGER CHECK (age >= 0 AND age <= 130),
     date_of_birth DATE,
@@ -100,7 +109,8 @@ CREATE TABLE IF NOT EXISTS public.patients (
     is_archived BOOLEAN DEFAULT FALSE NOT NULL,
     created_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
-    updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+    updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+    CONSTRAINT uq_patients_org_patient_number UNIQUE (organization_id, patient_number)
 );
 
 -- ==============================================================================
@@ -166,6 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_staff_profiles_role ON public.staff_profiles(role
 CREATE INDEX IF NOT EXISTS idx_staff_profiles_is_active ON public.staff_profiles(is_active);
 
 CREATE INDEX IF NOT EXISTS idx_patients_org_id ON public.patients(organization_id);
+CREATE INDEX IF NOT EXISTS idx_patients_org_patient_number ON public.patients(organization_id, patient_number);
 CREATE INDEX IF NOT EXISTS idx_patients_patient_number ON public.patients(patient_number);
 CREATE INDEX IF NOT EXISTS idx_patients_name ON public.patients USING gin (to_tsvector('simple', name));
 CREATE INDEX IF NOT EXISTS idx_patients_name_raw ON public.patients(name);
@@ -546,7 +557,7 @@ BEGIN
     VALUES (
         NEW.id,
         NEW.email,
-        COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email, '@', 1)),
+        COALESCE(NULLIF(TRIM(NEW.raw_user_meta_data->>'full_name'), ''), 'Clinical User'),
         COALESCE(NEW.raw_user_meta_data->>'role', 'doctor'),
         true,
         COALESCE(NEW.raw_user_meta_data->>'title', 'M.D.'),

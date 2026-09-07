@@ -16,15 +16,19 @@ import {
   FileCode2,
   Users,
   ShieldAlert,
+  ShieldCheck,
+  AlertCircle,
   ExternalLink
 } from 'lucide-react';
 import { usePatients } from '../../context/PatientContext';
 import { useAuth } from '../../context/AuthContext';
-import { ClinicInfo } from '../../types';
+import { ClinicInfo, StaffProfile } from '../../types';
 import { getSupabaseConfig, setSupabaseConfig } from '../../lib/supabase';
+import { getStaffDisplayName, formatStaffRole } from '../../utils/staffDisplay';
 
 export const ClinicSettings: React.FC = () => {
-  const { doctor } = useAuth();
+  const { doctor, staffProfile, updateStaffProfile } = useAuth();
+  const displayName = getStaffDisplayName(staffProfile);
   const { 
     clinicInfo, 
     updateClinicInfo, 
@@ -41,11 +45,33 @@ export const ClinicSettings: React.FC = () => {
   const [formData, setFormData] = useState<ClinicInfo>(clinicInfo);
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
 
+  // Staff profile edit state
+  const [staffFormData, setStaffFormData] = useState<Partial<StaffProfile>>({
+    full_name: staffProfile?.full_name || '',
+    title: staffProfile?.title || '',
+    specialty: staffProfile?.specialty || '',
+    license_number: staffProfile?.license_number || '',
+    phone: staffProfile?.phone || '',
+  });
+  const [staffUpdateMsg, setStaffUpdateMsg] = useState<{ text: string; error?: boolean } | null>(null);
+
   // Supabase connection keys state
   const currentConfig = getSupabaseConfig();
   const [supabaseUrl, setSupabaseUrl] = useState<string>(currentConfig.url);
   const [supabaseAnonKey, setSupabaseAnonKey] = useState<string>(currentConfig.anonKey);
   const [supabaseSaved, setSupabaseSaved] = useState<boolean>(false);
+
+  const handleStaffProfileSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setStaffUpdateMsg(null);
+    const res = await updateStaffProfile(staffFormData);
+    if (res.success) {
+      setStaffUpdateMsg({ text: 'Staff profile updated successfully!' });
+      setTimeout(() => setStaffUpdateMsg(null), 3500);
+    } else {
+      setStaffUpdateMsg({ text: res.error || 'Failed to update profile.', error: true });
+    }
+  };
 
   const handleClinicSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -70,8 +96,127 @@ export const ClinicSettings: React.FC = () => {
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs">
         <h1 className="text-xl font-bold text-slate-900 tracking-tight">Practice & System Settings</h1>
         <p className="text-xs text-slate-500 mt-0.5">
-          Configure clinic letterhead, doctor credentials, Supabase cloud database credentials, and audit security logs.
+          Configure clinic letterhead, authenticated staff credentials, Supabase cloud database credentials, and audit security logs.
         </p>
+      </div>
+
+      {/* Authenticated Staff Identity & Role Profile */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-6">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-blue-600" />
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800">
+              Authenticated Clinical Staff Identity
+            </h2>
+          </div>
+          <span className="text-xs px-2.5 py-1 rounded-full bg-blue-50 text-blue-700 font-bold border border-blue-200 capitalize">
+            {formatStaffRole(staffProfile?.role)}
+          </span>
+        </div>
+
+        {/* Read-Only Verified Profile Details */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 p-4 rounded-xl bg-slate-50 border border-slate-100">
+          <div>
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Canonical Display Name</span>
+            <span className="text-sm font-bold text-slate-900 block mt-0.5">{displayName}</span>
+          </div>
+          <div>
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Auth Email</span>
+            <span className="text-sm font-medium text-slate-700 block mt-0.5 truncate">{staffProfile?.email || 'Authenticated User'}</span>
+          </div>
+          <div>
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Clinical Role</span>
+            <span className="text-sm font-semibold text-blue-700 block mt-0.5">{formatStaffRole(staffProfile?.role)}</span>
+          </div>
+          <div>
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">Organization Scoping</span>
+            <span className="text-xs font-mono text-slate-600 block mt-1 truncate">{staffProfile?.organization_id || 'org-default'}</span>
+          </div>
+        </div>
+
+        {/* Form to Update Profile */}
+        <form onSubmit={handleStaffProfileSubmit} className="space-y-4 pt-2">
+          {staffUpdateMsg && (
+            <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${
+              staffUpdateMsg.error 
+                ? 'bg-rose-50 border border-rose-200 text-rose-700' 
+                : 'bg-emerald-50 border border-emerald-200 text-emerald-700'
+            }`}>
+              {staffUpdateMsg.error ? <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" /> : <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />}
+              <span>{staffUpdateMsg.text}</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Full Display Name (public.staff_profiles.full_name)
+              </label>
+              <input
+                type="text"
+                value={staffFormData.full_name}
+                onChange={(e) => setStaffFormData({ ...staffFormData, full_name: e.target.value })}
+                placeholder="e.g. Dr. Fausto Tancongco"
+                className="w-full text-sm rounded-lg border border-slate-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                required
+              />
+              <p className="text-[10px] text-slate-400 mt-1">
+                Canonical name displayed on dashboard, sidebar, and clinical printouts.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Professional Title & Degrees
+              </label>
+              <input
+                type="text"
+                value={staffFormData.title}
+                onChange={(e) => setStaffFormData({ ...staffFormData, title: e.target.value })}
+                placeholder="e.g. M.D., FPCP, FPCCP"
+                className="w-full text-sm rounded-lg border border-slate-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Clinical Specialty
+              </label>
+              <input
+                type="text"
+                value={staffFormData.specialty}
+                onChange={(e) => setStaffFormData({ ...staffFormData, specialty: e.target.value })}
+                placeholder="e.g. Internal Medicine & Pulmonology"
+                className="w-full text-sm rounded-lg border border-slate-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                PRC / Professional License Number
+              </label>
+              <input
+                type="text"
+                value={staffFormData.license_number}
+                onChange={(e) => setStaffFormData({ ...staffFormData, license_number: e.target.value })}
+                placeholder="e.g. PRC-0084921"
+                className="w-full text-sm rounded-lg border border-slate-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-2">
+            <p className="text-[11px] text-slate-400 max-w-md">
+              <span className="font-semibold text-slate-600">RBAC Guardrails:</span> Normal staff are restricted to modifying display credentials. Role reassignments, organization scoping, and account status require super-administrator authorization.
+            </p>
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold shadow-sm transition"
+            >
+              <Save className="w-3.5 h-3.5" /> Save Staff Profile
+            </button>
+          </div>
+        </form>
       </div>
 
       {/* Clinic Details / Letterhead Form */}
@@ -213,10 +358,10 @@ export const ClinicSettings: React.FC = () => {
 
         <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-600 space-y-2">
           <p>
-            The system comes with an instant offline demo engine seeded with the Melanie Arceñas records from your legacy medical database.
+            Connect to your live Supabase cloud database to enable secure, real-time clinical synchronization and row-level security.
           </p>
           <p>
-            To connect to your live Supabase cloud database, provide your <strong>Project URL</strong> and <strong>Anon Public Key</strong> below. The schema file is located at <code className="bg-white px-1.5 py-0.5 rounded border border-slate-200 font-mono text-slate-800">supabase-schema.sql</code>.
+            Provide your <strong>Project URL</strong> and <strong>Anon Public Key</strong> below. The schema file is located at <code className="bg-white px-1.5 py-0.5 rounded border border-slate-200 font-mono text-slate-800">supabase-schema.sql</code>.
           </p>
         </div>
 
@@ -260,7 +405,7 @@ export const ClinicSettings: React.FC = () => {
               }}
               className="text-xs text-slate-500 hover:text-slate-800"
             >
-              Reset to Demo Mode
+              Clear Custom Config
             </button>
 
             <button

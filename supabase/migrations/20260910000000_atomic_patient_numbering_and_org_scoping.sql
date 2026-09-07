@@ -1,14 +1,30 @@
 -- ==============================================================================
--- Migration: Duplicate Patient Prevention & Demographic Protection
+-- Migration: 20260910000000_atomic_patient_numbering_and_org_scoping.sql
 -- Description:
---   1. Adds optional date_of_birth and email columns to public.patients
---   2. Adds performance & demographic lookup indexes
---   3. Adds check_patient_duplicates_safe RPC for pre-save duplicate screening
---   4. Adds register_patient_safe atomic RPC with pg_advisory_xact_lock
---      concurrency control, organization boundary isolation, and audit logging
+--   Comprehensive, fully self-contained migration for patient registration:
+--   1. Adds optional date_of_birth and email columns to public.patients if missing.
+--   2. Adds organization-scoped demographic indexes for duplicate checking.
+--   3. Updates record_audit_event to permit DUPLICATE_PATIENT_BLOCKED action.
+--   4. Creates public.check_patient_duplicates_safe RPC for organization-isolated
+--      duplicate detection (SECURITY DEFINER, no cross-tenant exposure).
+--   5. Creates internal public.organization_patient_sequences for atomic,
+--      row-locked sequential patient numbering scoped per clinic/organization.
+--   6. Secures sequence table (internal to SECURITY DEFINER registration RPC,
+--      revoked from public/authenticated/anon).
+--   7. Safely identifies and drops any legacy global UNIQUE constraints on
+--      public.patients where the constrained columns are exactly (patient_number) alone,
+--      preserving primary keys and unrelated constraints.
+--   8. Enforces organization-scoped uniqueness: UNIQUE (organization_id, patient_number).
+--   9. Upgrades public.register_patient_safe RPC:
+--      - Validates manual numbers robustly (rejects P-00000, rejects numeric overflow,
+--        enforces length limits, guards against unhandled cast errors).
+--      - Dual transaction advisory locks (demographics lock AND manual number lock)
+--        to guarantee concurrent manual registrations for the same number fail with
+--        controlled PATIENT_NUMBER_EXISTS instead of PostgreSQL 23505.
+--      - Atomic row-locking allocation for auto-generated numbers.
 -- ==============================================================================
 
--- 1. Schema Extensions for Demographics & Contacts
+-- 1. Schema Extensions for Demographics & Contacts (Self-contained)
 ALTER TABLE public.patients ADD COLUMN IF NOT EXISTS date_of_birth DATE;
 ALTER TABLE public.patients ADD COLUMN IF NOT EXISTS email TEXT;
 
@@ -107,7 +123,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 REVOKE EXECUTE ON FUNCTION public.record_audit_event(TEXT, TEXT, TEXT, JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.record_audit_event(TEXT, TEXT, TEXT, JSONB) TO authenticated;
 
--- 4. Screen for potential duplicates within caller's organization
+-- 4. Screen for potential duplicates within caller's organization (Self-contained RPC)
 CREATE OR REPLACE FUNCTION public.check_patient_duplicates_safe(
     p_name TEXT,
     p_date_of_birth DATE DEFAULT NULL,
@@ -249,16 +265,88 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 REVOKE EXECUTE ON FUNCTION public.check_patient_duplicates_safe FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.check_patient_duplicates_safe TO authenticated;
 
--- 4.b Organization-Scoped Patient Sequences for Concurrency-Safe Numbering
+-- 5. Create Organization-Scoped Patient Sequence Table
 CREATE TABLE IF NOT EXISTS public.organization_patient_sequences (
     organization_id UUID PRIMARY KEY REFERENCES public.organizations(id) ON DELETE CASCADE,
     last_val BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
+-- Enable RLS and keep table strictly internal to SECURITY DEFINER functions.
+-- Authenticated and anon roles have no direct INSERT/UPDATE/DELETE/SELECT privileges.
 ALTER TABLE public.organization_patient_sequences ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "org_patient_seq_select_policy" ON public.organization_patient_sequences;
+REVOKE ALL ON TABLE public.organization_patient_sequences FROM PUBLIC, anon, authenticated;
 
--- 5. Atomic Patient Registration with Transaction Advisory Locking & Server-side Validation
+-- 6. Populate sequence counter for existing organizations based on max existing P-xxxxx number
+INSERT INTO public.organization_patient_sequences (organization_id, last_val, updated_at)
+SELECT 
+    o.id AS organization_id,
+    COALESCE(
+        (
+            SELECT MAX(NULLIF(regexp_replace(p.patient_number, '^P-0*', ''), '')::bigint)
+            FROM public.patients p
+            WHERE p.organization_id = o.id
+              AND p.patient_number ~ '^P-[0-9]{1,12}$'
+              AND regexp_replace(p.patient_number, '^P-0*', '') <> ''
+        ),
+        0
+    ) AS last_val,
+    timezone('utc'::text, now())
+FROM public.organizations o
+ON CONFLICT (organization_id) DO UPDATE
+SET last_val = GREATEST(public.organization_patient_sequences.last_val, EXCLUDED.last_val);
+
+-- 7. Robustly find and drop any legacy global UNIQUE constraint on patients.patient_number alone
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE n.nspname = 'public'
+          AND t.relname = 'patients'
+          AND c.contype = 'u' -- UNIQUE constraint (not primary key 'p')
+          AND ARRAY(
+              SELECT a.attname
+              FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+              ORDER BY k.ord
+          ) = ARRAY['patient_number']::name[]
+    ) LOOP
+        EXECUTE format('ALTER TABLE public.patients DROP CONSTRAINT %I', r.conname);
+    END LOOP;
+END $$;
+
+-- Enforce the intended organization-scoped uniqueness constraint
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE n.nspname = 'public'
+          AND t.relname = 'patients'
+          AND c.contype = 'u'
+          AND ARRAY(
+              SELECT a.attname
+              FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+              ORDER BY k.ord
+          ) = ARRAY['organization_id', 'patient_number']::name[]
+    ) THEN
+        ALTER TABLE public.patients ADD CONSTRAINT uq_patients_org_patient_number UNIQUE (organization_id, patient_number);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_patients_org_patient_number 
+    ON public.patients (organization_id, patient_number);
+
+-- 8. Replace register_patient_safe with hardened manual validation, concurrent manual lock, and atomic sequence allocation
 CREATE OR REPLACE FUNCTION public.register_patient_safe(
     p_patient_number TEXT DEFAULT NULL,
     p_name TEXT DEFAULT NULL,
@@ -284,8 +372,10 @@ DECLARE
     v_existing_patient_number TEXT;
     v_existing_name TEXT;
     v_final_patient_number TEXT;
+    v_num_digits TEXT;
     v_next_val BIGINT;
-    v_lock_key BIGINT;
+    v_demographic_lock_key BIGINT;
+    v_manual_num_lock_key BIGINT;
     v_created_row public.patients%ROWTYPE;
 BEGIN
     -- 1. Verify caller is authenticated active clinical staff
@@ -307,10 +397,10 @@ BEGIN
     -- 4. Normalization
     v_norm_name := lower(regexp_replace(trim(p_name), '\s+', ' ', 'g'));
 
-    -- 5. Advisory Transaction Locking (Organization-Scoped)
+    -- 5. Advisory Transaction Locking (Organization-Scoped Demographics)
     -- Prevents two concurrent requests from creating identical patients simultaneously
-    v_lock_key := ('x' || substr(md5(v_org_id::text || ':' || v_norm_name || ':' || COALESCE(p_date_of_birth::text, p_age::text, '')), 1, 15))::bit(64)::bigint;
-    PERFORM pg_advisory_xact_lock(v_lock_key);
+    v_demographic_lock_key := ('x' || substr(md5(v_org_id::text || ':DEMO:' || v_norm_name || ':' || COALESCE(p_date_of_birth::text, p_age::text, '')), 1, 15))::bit(64)::bigint;
+    PERFORM pg_advisory_xact_lock(v_demographic_lock_key);
 
     -- 6. Check for strong duplicate in caller's organization
     SELECT id, patient_number, name
@@ -375,10 +465,59 @@ BEGIN
         );
     END IF;
 
-    -- 8. Concurrency-Safe Patient ID generation (Atomic organization-scoped sequence)
+    -- 8. Concurrency-Safe Patient ID generation
     IF p_patient_number IS NOT NULL AND length(trim(p_patient_number)) > 0 THEN
         v_final_patient_number := trim(p_patient_number);
 
+        -- Enforce reasonable length constraint on custom patient numbers
+        IF length(v_final_patient_number) > 50 THEN
+            RETURN jsonb_build_object(
+                'success', false,
+                'code', 'INVALID_PATIENT_NUMBER',
+                'message', 'Patient number cannot exceed 50 characters.'
+            );
+        END IF;
+
+        -- Concurrency Advisory Lock on the specific manual number within this organization
+        -- Guarantees that if two concurrent requests submit the SAME manual number,
+        -- the second transaction serializes and returns PATIENT_NUMBER_EXISTS rather than throwing PostgreSQL 23505
+        v_manual_num_lock_key := ('x' || substr(md5(v_org_id::text || ':NUM:' || lower(v_final_patient_number)), 1, 15))::bit(64)::bigint;
+        PERFORM pg_advisory_xact_lock(v_manual_num_lock_key);
+
+        -- If the user provides a generated-style P-xxxxx number, validate strictly
+        IF v_final_patient_number ~* '^P-\d+$' THEN
+            v_num_digits := substring(v_final_patient_number from 3);
+
+            -- Reject pure zeros (e.g. P-0, P-00000) as valid clinic numbering starts at P-00001
+            IF v_num_digits ~ '^0+$' THEN
+                RETURN jsonb_build_object(
+                    'success', false,
+                    'code', 'INVALID_PATIENT_NUMBER',
+                    'message', 'Patient number cannot be zero (P-00000 is invalid).'
+                );
+            END IF;
+
+            -- Prevent integer overflow: cap numeric portion at max 12 digits
+            IF length(v_num_digits) > 12 THEN
+                RETURN jsonb_build_object(
+                    'success', false,
+                    'code', 'INVALID_PATIENT_NUMBER',
+                    'message', 'Numeric suffix in patient number exceeds allowable limit.'
+                );
+            END IF;
+
+            -- Safely extract numeric value
+            v_next_val := NULLIF(regexp_replace(v_num_digits, '^0*', ''), '')::bigint;
+
+            -- Raise organization sequence watermark so future auto-generated numbers do not collide
+            INSERT INTO public.organization_patient_sequences (organization_id, last_val, updated_at)
+            VALUES (v_org_id, v_next_val, timezone('utc'::text, now()))
+            ON CONFLICT (organization_id) DO UPDATE
+            SET last_val = GREATEST(public.organization_patient_sequences.last_val, EXCLUDED.last_val),
+                updated_at = timezone('utc'::text, now());
+        END IF;
+
+        -- Verify manual number is not already assigned in this organization
         IF EXISTS (
             SELECT 1 FROM public.patients
             WHERE organization_id = v_org_id
@@ -390,17 +529,8 @@ BEGIN
                 'message', 'Patient number "' || v_final_patient_number || '" is already assigned in this organization.'
             );
         END IF;
-
-        IF v_final_patient_number ~ '^P-\d+$' THEN
-            v_next_val := regexp_replace(v_final_patient_number, '^P-0*', '')::bigint;
-
-            INSERT INTO public.organization_patient_sequences (organization_id, last_val, updated_at)
-            VALUES (v_org_id, v_next_val, timezone('utc'::text, now()))
-            ON CONFLICT (organization_id) DO UPDATE
-            SET last_val = GREATEST(public.organization_patient_sequences.last_val, EXCLUDED.last_val),
-                updated_at = timezone('utc'::text, now());
-        END IF;
     ELSE
+        -- Ensure sequence row exists for this organization, initialized to highest existing P-xxxxx number
         INSERT INTO public.organization_patient_sequences (organization_id, last_val, updated_at)
         VALUES (
             v_org_id,
@@ -408,12 +538,14 @@ BEGIN
                 SELECT MAX(NULLIF(regexp_replace(patient_number, '^P-0*', ''), '')::bigint)
                 FROM public.patients
                 WHERE organization_id = v_org_id
-                  AND patient_number ~ '^P-\d+$'
+                  AND patient_number ~ '^P-[0-9]{1,12}$'
+                  AND regexp_replace(patient_number, '^P-0*', '') <> ''
             ), 0),
             timezone('utc'::text, now())
         )
         ON CONFLICT (organization_id) DO NOTHING;
 
+        -- Atomically lock the organization sequence row and allocate next consecutive number
         LOOP
             UPDATE public.organization_patient_sequences
             SET last_val = last_val + 1,
@@ -423,6 +555,7 @@ BEGIN
 
             v_final_patient_number := 'P-' || lpad(v_next_val::text, 5, '0');
 
+            -- Ensure no past manual entry had this specific number in this organization
             EXIT WHEN NOT EXISTS (
                 SELECT 1 FROM public.patients
                 WHERE organization_id = v_org_id

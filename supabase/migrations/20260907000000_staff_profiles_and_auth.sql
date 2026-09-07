@@ -546,7 +546,7 @@ BEGIN
     VALUES (
         NEW.id,
         NEW.email,
-        COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email, '@', 1)),
+        COALESCE(NULLIF(TRIM(NEW.raw_user_meta_data->>'full_name'), ''), 'Clinical User'),
         COALESCE(NEW.raw_user_meta_data->>'role', 'doctor'),
         true,
         COALESCE(NEW.raw_user_meta_data->>'title', 'M.D.'),

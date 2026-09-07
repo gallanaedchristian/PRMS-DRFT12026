@@ -18,6 +18,7 @@ import {
 import { usePatients } from '../../context/PatientContext';
 import { useAuth } from '../../context/AuthContext';
 import { Patient, MedicalRecord } from '../../types';
+import { getStaffDisplayName } from '../../utils/staffDisplay';
 
 interface DoctorDashboardProps {
   onSelectPatient: (patient: Patient) => void;
@@ -32,7 +33,8 @@ export const DoctorDashboard: React.FC<DoctorDashboardProps> = ({
   onNewRecord,
   onViewRecord,
 }) => {
-  const { doctor } = useAuth();
+  const { doctor, staffProfile } = useAuth();
+  const displayName = getStaffDisplayName(staffProfile);
   const { 
     patients, 
     medicalRecords, 
@@ -80,14 +82,46 @@ export const DoctorDashboard: React.FC<DoctorDashboardProps> = ({
         <div className="relative z-10 max-w-2xl">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold bg-blue-500/20 text-blue-300 border border-blue-400/30 mb-3">
             <Activity className="w-3.5 h-3.5" />
-            Healthcare Electronic Health Record Platform • 2026 SaaS
+            <span>Healthcare Electronic Health Record Platform</span>
+            {staffProfile?.role && (
+              <>
+                <span className="opacity-60">•</span>
+                <span className="capitalize">{staffProfile.role} Workspace</span>
+              </>
+            )}
           </div>
           <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-white">
-            Welcome back, {doctor?.full_name || 'Dr. Fausto Tancongco'}
+            Welcome back, {displayName}
           </h1>
-          <p className="text-xs md:text-sm text-slate-300 mt-1.5 leading-relaxed">
-            {clinicInfo.name} — {clinicInfo.specialty}. Manage clinical consultations, digital patient charts, and anatomical findings.
-          </p>
+          <div className="text-xs md:text-sm text-slate-300 mt-2 leading-relaxed flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="font-semibold text-white capitalize">
+              {staffProfile?.role ? `${staffProfile.role === 'doctor' ? 'Physician' : staffProfile.role}` : 'Staff'}
+            </span>
+            {staffProfile?.title && (
+              <>
+                <span className="opacity-60">•</span>
+                <span>{staffProfile.title}</span>
+              </>
+            )}
+            {(staffProfile?.specialty || clinicInfo.specialty) && (
+              <>
+                <span className="opacity-60">•</span>
+                <span>{staffProfile?.specialty || clinicInfo.specialty}</span>
+              </>
+            )}
+            {staffProfile?.license_number && (
+              <>
+                <span className="opacity-60">•</span>
+                <span className="text-slate-400">Lic. #{staffProfile.license_number}</span>
+              </>
+            )}
+            {staffProfile?.organization_id && (
+              <>
+                <span className="opacity-60">•</span>
+                <span className="text-slate-400 font-mono text-[11px]">Org: {staffProfile.organization_id}</span>
+              </>
+            )}
+          </div>
 
           <div className="flex flex-wrap items-center gap-3 mt-6">
             <button
