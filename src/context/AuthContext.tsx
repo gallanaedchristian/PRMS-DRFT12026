@@ -1,192 +1,434 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { DoctorProfile } from '../types';
-import { getSupabase, DEFAULT_DOCTOR } from '../lib/supabase';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { DoctorProfile, StaffProfile, StaffRole } from '../types';
+import { getSupabase } from '../lib/supabase';
+import { SupabaseClient } from '@supabase/supabase-js';
+
+const ALLOWED_STAFF_ROLES: StaffRole[] = ['super_admin', 'doctor', 'nurse', 'staff'];
+
+interface AuthResponse {
+  success: boolean;
+  error?: string;
+}
 
 interface AuthContextType {
   doctor: DoctorProfile | null;
+  staffProfile: StaffProfile | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   authError: string | null;
-  login: (email: string, password: string, remember?: boolean) => Promise<boolean>;
+  isRecoveryMode: boolean;
+  signInWithPassword: (email: string, password: string) => Promise<AuthResponse>;
+  login: (email: string, password: string) => Promise<boolean>;
   signIn: (email: string, password: string) => Promise<boolean>;
-  loginDemo: () => void;
-  loginWithPasscode: (passcode: string) => boolean;
-  logout: () => Promise<void>;
+  resetPasswordForEmail: (email: string) => Promise<AuthResponse>;
+  updateUserPassword: (newPassword: string) => Promise<AuthResponse>;
   signOut: () => Promise<void>;
+  logout: () => Promise<void>;
   updateProfile: (updated: Partial<DoctorProfile>) => void;
-  isDemoMode: boolean;
+  clearAuthError: () => void;
+  setIsRecoveryMode: (isRecovery: boolean) => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [doctor, setDoctor] = useState<DoctorProfile | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
+/**
+ * Loads and verifies that the authenticated user has an active, valid staff profile in public.staff_profiles.
+ * Enforces:
+ * 1. Profile existence.
+ * 2. Disabled account rule (is_active must be true).
+ * 3. Role authorization check (super_admin, doctor, nurse, staff).
+ */
+async function verifyStaffProfile(
+  supabase: SupabaseClient,
+  authUserId: string,
+  userEmail?: string
+): Promise<{ profile: StaffProfile | null; doctorData: DoctorProfile | null; error: string | null }> {
+  try {
+    // 1. Query staff_profiles table by auth_user_id
+    let { data: staff, error } = await supabase
+      .from('staff_profiles')
+      .select('*')
+      .eq('auth_user_id', authUserId)
+      .maybeSingle();
 
-  useEffect(() => {
-    // Check saved session
-    const initAuth = async () => {
-      setIsLoading(true);
-      const supabase = getSupabase();
+    // Secondary fallback: query staff_profiles by id if matched
+    if (!staff && !error) {
+      const res = await supabase
+        .from('staff_profiles')
+        .select('*')
+        .eq('id', authUserId)
+        .maybeSingle();
+      staff = res.data;
+    }
 
-      if (supabase) {
-        try {
-          const { data: { session }, error } = await supabase.auth.getSession();
-          if (session?.user && !error) {
-            // Fetch profile
-            const { data: profile } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('id', session.user.id)
-              .single();
+    // Fallback: check legacy profiles table if migration is still pending
+    if (!staff) {
+      const legacyRes = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', authUserId)
+        .maybeSingle();
 
-            if (profile) {
-              setDoctor({
-                id: profile.id,
-                email: session.user.email || profile.email || 'doctor@medrecords.cloud',
-                full_name: profile.full_name || 'Dr. Physician',
-                title: profile.title || 'M.D.',
-                specialty: profile.specialty || 'General Practitioner',
-                license_number: profile.license_number || '',
-                role: profile.role || 'doctor',
-                created_at: profile.created_at || new Date().toISOString(),
-              });
-              setIsDemoMode(false);
-              setIsLoading(false);
-              return;
-            }
-          }
-        } catch (err) {
-          console.warn('Supabase auth session fetch failed, checking local session:', err);
-        }
+      if (legacyRes.data) {
+        staff = {
+          id: legacyRes.data.id,
+          auth_user_id: authUserId,
+          full_name: legacyRes.data.full_name || 'Medical Practitioner',
+          email: userEmail || legacyRes.data.email || '',
+          role: (legacyRes.data.role as StaffRole) || 'doctor',
+          practitioner_id: legacyRes.data.id,
+          is_active: true,
+          created_at: legacyRes.data.created_at || new Date().toISOString(),
+          updated_at: legacyRes.data.updated_at || new Date().toISOString(),
+          title: legacyRes.data.title || 'M.D.',
+          specialty: legacyRes.data.specialty || 'General Practitioner',
+          license_number: legacyRes.data.license_number || '',
+        };
       }
+    }
 
-      // Check local storage for remembered session
-      const savedDoc = localStorage.getItem('medrecords_active_doctor');
-      if (savedDoc) {
-        try {
-          const parsed = JSON.parse(savedDoc);
-          setDoctor(parsed);
-          setIsDemoMode(true);
-        } catch {
-          setDoctor(null);
-        }
-      } else {
-        setDoctor(null);
-      }
-      setIsLoading(false);
+    // Rule 1: Profile must exist
+    if (!staff) {
+      return {
+        profile: null,
+        doctorData: null,
+        error: 'Access Denied: No clinical staff profile found associated with this Supabase account. Please contact your system administrator.',
+      };
+    }
+
+    // Rule 2: Account must be active
+    if (staff.is_active === false) {
+      return {
+        profile: null,
+        doctorData: null,
+        error: 'Access Denied: This staff profile has been deactivated. Please contact your clinical administrator.',
+      };
+    }
+
+    // Rule 3: Allowed role verification
+    const role = (staff.role || '').toLowerCase() as StaffRole;
+    if (!ALLOWED_STAFF_ROLES.includes(role)) {
+      return {
+        profile: null,
+        doctorData: null,
+        error: `Access Denied: Unauthorized role '${staff.role}'. Access is restricted to authorized healthcare personnel.`,
+      };
+    }
+
+    const staffRecord: StaffProfile = {
+      id: staff.id,
+      auth_user_id: staff.auth_user_id || authUserId,
+      organization_id: staff.organization_id || null,
+      full_name: staff.full_name || 'Healthcare Practitioner',
+      email: staff.email || userEmail || '',
+      role,
+      practitioner_id: staff.practitioner_id || null,
+      is_active: true,
+      created_at: staff.created_at || new Date().toISOString(),
+      updated_at: staff.updated_at || new Date().toISOString(),
+      title: staff.title || (role === 'doctor' ? 'M.D.' : role.toUpperCase()),
+      specialty: staff.specialty || (role === 'doctor' ? 'Clinical Practice' : 'Clinical Support'),
+      license_number: staff.license_number || '',
+      phone: staff.phone,
     };
 
-    initAuth();
+    const docRecord: DoctorProfile = {
+      id: staffRecord.id,
+      auth_user_id: staffRecord.auth_user_id,
+      organization_id: staffRecord.organization_id,
+      email: staffRecord.email,
+      full_name: staffRecord.full_name,
+      title: staffRecord.title || 'M.D.',
+      specialty: staffRecord.specialty || 'Clinical Practice',
+      license_number: staffRecord.license_number || '',
+      role: staffRecord.role,
+      practitioner_id: staffRecord.practitioner_id,
+      is_active: staffRecord.is_active,
+      created_at: staffRecord.created_at,
+      updated_at: staffRecord.updated_at,
+    };
+
+    return {
+      profile: staffRecord,
+      doctorData: docRecord,
+      error: null,
+    };
+  } catch (err: any) {
+    return {
+      profile: null,
+      doctorData: null,
+      error: err.message || 'Error verifying staff authorization.',
+    };
+  }
+}
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [doctor, setDoctor] = useState<DoctorProfile | null>(null);
+  const [staffProfile, setStaffProfile] = useState<StaffProfile | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isRecoveryMode, setIsRecoveryMode] = useState<boolean>(false);
+
+  const clearAuthError = useCallback(() => {
+    setAuthError(null);
   }, []);
 
-  const login = async (email: string, password: string, remember: boolean = true): Promise<boolean> => {
+  // Initialize and maintain Supabase authenticated session
+  useEffect(() => {
+    const supabase = getSupabase();
+
+    // Check for password recovery hash in URL (Supabase recovery link)
+    if (typeof window !== 'undefined' && window.location.hash) {
+      const hash = window.location.hash;
+      if (hash.includes('type=recovery') || hash.includes('access_token=')) {
+        setIsRecoveryMode(true);
+      }
+    }
+
+    if (!supabase) {
+      setIsLoading(false);
+      return;
+    }
+
+    // 1. Check existing session on load
+    const restoreSession = async () => {
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession();
+        if (session?.user && !error) {
+          const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
+            supabase,
+            session.user.id,
+            session.user.email
+          );
+
+          if (profile && doctorData && !profileErr) {
+            setStaffProfile(profile);
+            setDoctor(doctorData);
+            setAuthError(null);
+          } else {
+            // Profile missing, inactive, or unauthorized - force sign out
+            await supabase.auth.signOut();
+            setStaffProfile(null);
+            setDoctor(null);
+            if (profileErr) {
+              setAuthError(profileErr);
+            }
+          }
+        } else {
+          setStaffProfile(null);
+          setDoctor(null);
+        }
+      } catch (err) {
+        console.warn('Supabase session verification failed:', err);
+        setStaffProfile(null);
+        setDoctor(null);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    restoreSession();
+
+    // 2. React to Auth State Changes (login, logout, token refresh, password recovery)
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsRecoveryMode(true);
+        setIsLoading(false);
+        return;
+      }
+
+      if (event === 'SIGNED_OUT' || !session?.user) {
+        setStaffProfile(null);
+        setDoctor(null);
+        setIsLoading(false);
+        return;
+      }
+
+      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+        const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
+          supabase,
+          session.user.id,
+          session.user.email
+        );
+
+        if (profile && doctorData && !profileErr) {
+          setStaffProfile(profile);
+          setDoctor(doctorData);
+          setAuthError(null);
+        } else {
+          await supabase.auth.signOut();
+          setStaffProfile(null);
+          setDoctor(null);
+          if (profileErr) {
+            setAuthError(profileErr);
+          }
+        }
+        setIsLoading(false);
+      }
+    });
+
+    return () => {
+      authListener?.subscription?.unsubscribe();
+    };
+  }, []);
+
+  /**
+   * Supabase email/password authentication
+   * Strictly uses supabase.auth.signInWithPassword.
+   * Never compares or stores passwords in database tables or state.
+   */
+  const signInWithPassword = async (
+    email: string,
+    password: string
+  ): Promise<AuthResponse> => {
     setIsLoading(true);
     setAuthError(null);
 
     const supabase = getSupabase();
-    if (supabase) {
-      try {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-
-        if (error) {
-          throw error;
-        }
-
-        if (data.user) {
-          const { data: profile } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', data.user.id)
-            .single();
-
-          const doc: DoctorProfile = {
-            id: data.user.id,
-            email: data.user.email || email,
-            full_name: profile?.full_name || email.split('@')[0] || 'Dr. Physician',
-            title: profile?.title || 'M.D.',
-            specialty: profile?.specialty || 'General Practitioner',
-            license_number: profile?.license_number || 'PRC-VERIFIED',
-            role: (profile?.role as any) || 'doctor',
-            created_at: data.user.created_at || new Date().toISOString(),
-          };
-
-          setDoctor(doc);
-          setIsDemoMode(false);
-          if (remember) {
-            localStorage.setItem('medrecords_active_doctor', JSON.stringify(doc));
-          }
-          setIsLoading(false);
-          return true;
-        }
-      } catch (err: any) {
-        // Fallback check if user wants demo doctor
-        if (email.toLowerCase().includes('fausto') || email.toLowerCase().includes('demo') || password === 'demo123') {
-          setDoctor(DEFAULT_DOCTOR);
-          setIsDemoMode(true);
-          if (remember) {
-            localStorage.setItem('medrecords_active_doctor', JSON.stringify(DEFAULT_DOCTOR));
-          }
-          setIsLoading(false);
-          return true;
-        }
-
-        setAuthError(err.message || 'Invalid email or password. Please verify credentials.');
-        setIsLoading(false);
-        return false;
-      }
-    }
-
-    // Local / Demo authorization
-    if (password.length < 4) {
-      setAuthError('Password must be at least 4 characters long.');
+    if (!supabase) {
+      const msg = 'Supabase client is not configured. Please provide your Supabase URL and Anon Key.';
+      setAuthError(msg);
       setIsLoading(false);
-      return false;
+      return { success: false, error: msg };
     }
 
-    const doc: DoctorProfile = {
-      ...DEFAULT_DOCTOR,
-      email: email.trim(),
-      full_name: email.toLowerCase().includes('fausto') ? DEFAULT_DOCTOR.full_name : `Dr. ${email.split('@')[0]}`,
-    };
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
 
-    setDoctor(doc);
-    setIsDemoMode(true);
-    if (remember) {
-      localStorage.setItem('medrecords_active_doctor', JSON.stringify(doc));
-    }
-    setIsLoading(false);
-    return true;
-  };
+      if (error) {
+        setAuthError(error.message);
+        setIsLoading(false);
+        return { success: false, error: error.message };
+      }
 
-  const signIn = async (email: string, password: string): Promise<boolean> => {
-    return login(email, password, true);
-  };
+      if (!data.user) {
+        const msg = 'Authentication failed. No authenticated user returned.';
+        setAuthError(msg);
+        setIsLoading(false);
+        return { success: false, error: msg };
+      }
 
-  const loginDemo = () => {
-    setDoctor(DEFAULT_DOCTOR);
-    localStorage.setItem('medrecords_active_doctor', JSON.stringify(DEFAULT_DOCTOR));
-    setIsDemoMode(true);
-  };
+      // Step 5: Load associated staff profile and verify
+      const { profile, doctorData, error: profileErr } = await verifyStaffProfile(
+        supabase,
+        data.user.id,
+        data.user.email
+      );
 
-  const loginWithPasscode = (passcode: string): boolean => {
-    if (passcode.trim().toUpperCase() === 'DRFT1') {
-      setDoctor(DEFAULT_DOCTOR);
-      localStorage.setItem('medrecords_active_doctor', JSON.stringify(DEFAULT_DOCTOR));
-      setIsDemoMode(true);
+      if (profileErr || !profile || !doctorData) {
+        // Deny access and terminate session immediately
+        await supabase.auth.signOut();
+        setDoctor(null);
+        setStaffProfile(null);
+        const errMsg = profileErr || 'Access Denied: Staff profile validation failed.';
+        setAuthError(errMsg);
+        setIsLoading(false);
+        return { success: false, error: errMsg };
+      }
+
+      // Step 6: Grant clinical workspace access
+      setStaffProfile(profile);
+      setDoctor(doctorData);
       setAuthError(null);
-      return true;
+      setIsRecoveryMode(false);
+      setIsLoading(false);
+      return { success: true };
+    } catch (err: any) {
+      const msg = err.message || 'An unexpected error occurred during authentication.';
+      setAuthError(msg);
+      setIsLoading(false);
+      return { success: false, error: msg };
     }
-    setAuthError('Invalid passcode. Please enter the authorized clinical passcode.');
-    return false;
   };
 
-  const logout = async () => {
+  /**
+   * Supabase Password Reset request
+   */
+  const resetPasswordForEmail = async (email: string): Promise<AuthResponse> => {
+    setIsLoading(true);
+    setAuthError(null);
+
+    const supabase = getSupabase();
+    if (!supabase) {
+      const msg = 'Supabase client is not configured.';
+      setAuthError(msg);
+      setIsLoading(false);
+      return { success: false, error: msg };
+    }
+
+    try {
+      const redirectUrl = typeof window !== 'undefined' 
+        ? `${window.location.origin}${window.location.pathname}#recovery`
+        : undefined;
+
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: redirectUrl,
+      });
+
+      if (error) {
+        setAuthError(error.message);
+        setIsLoading(false);
+        return { success: false, error: error.message };
+      }
+
+      setIsLoading(false);
+      return { success: true };
+    } catch (err: any) {
+      const msg = err.message || 'Failed to send password reset request.';
+      setAuthError(msg);
+      setIsLoading(false);
+      return { success: false, error: msg };
+    }
+  };
+
+  /**
+   * Password Update for Recovery sessions
+   */
+  const updateUserPassword = async (newPassword: string): Promise<AuthResponse> => {
+    setIsLoading(true);
+    setAuthError(null);
+
+    const supabase = getSupabase();
+    if (!supabase) {
+      const msg = 'Supabase client is not configured.';
+      setAuthError(msg);
+      setIsLoading(false);
+      return { success: false, error: msg };
+    }
+
+    try {
+      const { error } = await supabase.auth.updateUser({
+        password: newPassword,
+      });
+
+      if (error) {
+        setAuthError(error.message);
+        setIsLoading(false);
+        return { success: false, error: error.message };
+      }
+
+      setIsRecoveryMode(false);
+      if (typeof window !== 'undefined' && window.location.hash) {
+        window.history.replaceState(null, '', window.location.pathname);
+      }
+      setIsLoading(false);
+      return { success: true };
+    } catch (err: any) {
+      const msg = err.message || 'Failed to update password.';
+      setAuthError(msg);
+      setIsLoading(false);
+      return { success: false, error: msg };
+    }
+  };
+
+  /**
+   * Standard Sign Out
+   */
+  const signOut = async () => {
+    setIsLoading(true);
     const supabase = getSupabase();
     if (supabase) {
       try {
@@ -195,34 +437,47 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn('Supabase signOut error:', err);
       }
     }
-    localStorage.removeItem('medrecords_active_doctor');
     setDoctor(null);
+    setStaffProfile(null);
+    setAuthError(null);
+    setIsRecoveryMode(false);
+    setIsLoading(false);
   };
 
-  const signOut = logout;
+  const logout = signOut;
+
+  const login = async (email: string, password: string): Promise<boolean> => {
+    const res = await signInWithPassword(email, password);
+    return res.success;
+  };
+
+  const signIn = login;
 
   const updateProfile = (updated: Partial<DoctorProfile>) => {
     if (!doctor) return;
     const newDoc = { ...doctor, ...updated };
     setDoctor(newDoc);
-    localStorage.setItem('medrecords_active_doctor', JSON.stringify(newDoc));
   };
 
   return (
     <AuthContext.Provider
       value={{
         doctor,
-        isAuthenticated: Boolean(doctor),
+        staffProfile,
+        isAuthenticated: Boolean(doctor && doctor.is_active !== false),
         isLoading,
         authError,
+        isRecoveryMode,
+        signInWithPassword,
         login,
         signIn,
-        loginDemo,
-        loginWithPasscode,
-        logout,
+        resetPasswordForEmail,
+        updateUserPassword,
         signOut,
+        logout,
         updateProfile,
-        isDemoMode,
+        clearAuthError,
+        setIsRecoveryMode,
       }}
     >
       {children}

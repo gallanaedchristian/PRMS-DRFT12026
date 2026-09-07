@@ -481,6 +481,12 @@ export function getSupabase(): SupabaseClient | null {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
+          detectSessionInUrl: true,
+        },
+        realtime: {
+          params: {
+            eventsPerSecond: 10,
+          },
         },
       });
     } catch (err) {
@@ -490,6 +496,105 @@ export function getSupabase(): SupabaseClient | null {
   }
   return supabaseInstance;
 }
+
+/**
+ * Scoped Realtime channel helper for patients.
+ * Strictly listens to INSERT and UPDATE only (no DELETE).
+ */
+export function subscribeToPatientsChannel(
+  onPatientChange: (payload: { eventType: 'INSERT' | 'UPDATE'; new: any; old: any }) => void
+) {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+
+  return supabase
+    .channel('realtime:patients')
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'patients',
+      },
+      (payload) => onPatientChange({ eventType: 'INSERT', new: payload.new, old: payload.old })
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'patients',
+      },
+      (payload) => onPatientChange({ eventType: 'UPDATE', new: payload.new, old: payload.old })
+    )
+    .subscribe();
+}
+
+/**
+ * Scoped Realtime channel helper for a specific patient's clinical records and drawings.
+ * Strictly listens to INSERT and UPDATE only (no DELETE).
+ * Strictly scoped by patient_id filter.
+ */
+export function subscribeToPatientClinicalChannel(
+  patientId: string,
+  onRecordChange: (payload: { eventType: 'INSERT' | 'UPDATE'; new: any; old: any }) => void,
+  onDrawingChange: (payload: { eventType: 'INSERT' | 'UPDATE'; new: any; old: any }) => void
+) {
+  const supabase = getSupabase();
+  if (!supabase || !patientId) return null;
+
+  return supabase
+    .channel(`realtime:clinical-patient:${patientId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'medical_records',
+        filter: `patient_id=eq.${patientId}`,
+      },
+      (payload) => onRecordChange({ eventType: 'INSERT', new: payload.new, old: payload.old })
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'medical_records',
+        filter: `patient_id=eq.${patientId}`,
+      },
+      (payload) => onRecordChange({ eventType: 'UPDATE', new: payload.new, old: payload.old })
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'clinical_drawings',
+        filter: `patient_id=eq.${patientId}`,
+      },
+      (payload) => onDrawingChange({ eventType: 'INSERT', new: payload.new, old: payload.old })
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'clinical_drawings',
+        filter: `patient_id=eq.${patientId}`,
+      },
+      (payload) => onDrawingChange({ eventType: 'UPDATE', new: payload.new, old: payload.old })
+    )
+    .subscribe();
+}
+
+/**
+ * Legacy alias for backwards compatibility
+ */
+export const subscribeToPatientRecordsChannel = (
+  patientId: string,
+  onRecordChange: (payload: any) => void
+) => subscribeToPatientClinicalChannel(patientId, onRecordChange, () => {});
 
 export function saveSupabaseConfig(url: string, anonKey: string) {
   localStorage.setItem('medrecords_supabase_url', url.trim());

@@ -3,6 +3,7 @@ import {
   User, 
   Phone, 
   MapPin, 
+  Mail,
   Calendar, 
   FileText, 
   Plus, 
@@ -103,6 +104,14 @@ export const PatientProfile: React.FC<PatientProfileProps> = ({
                   <span>
                     <strong className="text-slate-800">Age:</strong> {patient.age} yrs old
                   </span>
+                  {patient.date_of_birth && (
+                    <>
+                      <span>•</span>
+                      <span>
+                        <strong className="text-slate-800">DOB:</strong> {patient.date_of_birth}
+                      </span>
+                    </>
+                  )}
                   <span>•</span>
                   <span>
                     <strong className="text-slate-800">Sex:</strong> {patient.sex === 'F' ? 'Female' : patient.sex === 'M' ? 'Male' : 'Other'}
@@ -123,6 +132,12 @@ export const PatientProfile: React.FC<PatientProfileProps> = ({
                     <Phone className="w-3.5 h-3.5 text-slate-400" />
                     {patient.phone || 'No phone recorded'}
                   </span>
+                  {patient.email && (
+                    <span className="flex items-center gap-1.5">
+                      <Mail className="w-3.5 h-3.5 text-slate-400" />
+                      {patient.email}
+                    </span>
+                  )}
                   <span className="flex items-center gap-1.5">
                     <MapPin className="w-3.5 h-3.5 text-slate-400" />
                     {patient.address || 'No address recorded'}

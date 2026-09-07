@@ -13,7 +13,10 @@ import {
   Stethoscope,
   Clock,
   UserCheck,
-  FileCode2
+  FileCode2,
+  Users,
+  ShieldAlert,
+  ExternalLink
 } from 'lucide-react';
 import { usePatients } from '../../context/PatientContext';
 import { useAuth } from '../../context/AuthContext';
@@ -22,7 +25,17 @@ import { getSupabaseConfig, setSupabaseConfig } from '../../lib/supabase';
 
 export const ClinicSettings: React.FC = () => {
   const { doctor } = useAuth();
-  const { clinicInfo, updateClinicInfo, auditLogs, syncStatus } = usePatients();
+  const { 
+    clinicInfo, 
+    updateClinicInfo, 
+    auditLogs, 
+    syncStatus, 
+    scanExistingDuplicates, 
+    setSelectedPatient, 
+    setActiveView 
+  } = usePatients();
+
+  const duplicateClusters = scanExistingDuplicates ? scanExistingDuplicates() : [];
 
   // Clinic info form state
   const [formData, setFormData] = useState<ClinicInfo>(clinicInfo);
@@ -261,13 +274,119 @@ export const ClinicSettings: React.FC = () => {
         </form>
       </div>
 
+      {/* Duplicate Patient Audit & Review Section */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <Users className="w-4 h-4 text-blue-600" />
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800">
+              Duplicate Patient Screening & Integrity Audit
+            </h2>
+          </div>
+          <span className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
+            duplicateClusters.length > 0 
+              ? 'bg-amber-50 text-amber-700 border border-amber-200' 
+              : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+          }`}>
+            {duplicateClusters.length > 0 
+              ? `${duplicateClusters.length} duplicate cluster${duplicateClusters.length > 1 ? 's' : ''} detected` 
+              : 'Zero duplicate clusters detected'}
+          </span>
+        </div>
+
+        <p className="text-xs text-slate-500 leading-relaxed">
+          The clinic prevents concurrent creation of duplicate patient files using atomic database locking and normalized demographic matching.
+          In accordance with medical record safety standards, existing duplicates are <strong>never automatically merged or deleted</strong>, but are audited here for clinical review.
+        </p>
+
+        {duplicateClusters.length === 0 ? (
+          <div className="p-4 bg-emerald-50/50 border border-emerald-100 rounded-xl flex items-center gap-3 text-xs text-emerald-800">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>All existing patient records in your clinic database have distinct demographic profiles.</span>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {duplicateClusters.map((cluster) => (
+              <div 
+                key={cluster.id} 
+                className={`p-4 rounded-xl border ${
+                  cluster.severity === 'strong' 
+                    ? 'bg-rose-50/40 border-rose-200' 
+                    : 'bg-amber-50/40 border-amber-200'
+                } space-y-2.5`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                      cluster.severity === 'strong' 
+                        ? 'bg-rose-100 text-rose-800' 
+                        : 'bg-amber-100 text-amber-800'
+                    }`}>
+                      {cluster.severity === 'strong' ? 'STRONG DUPLICATE' : 'CONTACT SIMILARITY'}
+                    </span>
+                    <span className="text-xs font-bold text-slate-900">
+                      {cluster.reason}
+                    </span>
+                  </div>
+                  <span className="text-xs text-slate-500 font-medium">
+                    {cluster.patients.length} records involved
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                  {cluster.patients.map((pat) => (
+                    <div 
+                      key={pat.id}
+                      className="bg-white p-3 rounded-lg border border-slate-200 flex items-center justify-between shadow-2xs hover:border-blue-400 transition"
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-900">{pat.name}</span>
+                          <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded">
+                            {pat.patient_number}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5 flex gap-2">
+                          <span>Age {pat.age}</span>
+                          <span>•</span>
+                          <span>{pat.sex === 'F' ? 'Female' : 'Male'}</span>
+                          {pat.phone && (
+                            <>
+                              <span>•</span>
+                              <span>{pat.phone}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedPatient(pat);
+                          setActiveView('profile');
+                        }}
+                        className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-800 p-1.5 rounded-md hover:bg-blue-50 transition"
+                        title="View Patient Chart"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">View Chart</span>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Security & Audit Logs Section */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <Shield className="w-4 h-4 text-indigo-600" />
             <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800">
-              HIPAA Compliant Clinical Audit Trail
+              Role-Based Clinical Audit Trail
             </h2>
           </div>
           <span className="text-xs text-slate-400 font-mono">

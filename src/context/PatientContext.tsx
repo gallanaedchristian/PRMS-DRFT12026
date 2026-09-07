@@ -1,14 +1,26 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { Patient, MedicalRecord, ClinicalDrawing, AuditLog, ClinicInfo, ActiveView } from '../types';
+import { 
+  Patient, 
+  MedicalRecord, 
+  ClinicalDrawing, 
+  AuditLog, 
+  ClinicInfo, 
+  ActiveView,
+  DuplicateCheckResult,
+  DuplicateCluster 
+} from '../types';
 import { 
   getSupabase, 
   getSupabaseConfig,
+  subscribeToPatientsChannel,
+  subscribeToPatientClinicalChannel,
   SEED_PATIENTS, 
   SEED_MEDICAL_RECORDS, 
   SEED_AUDIT_LOGS, 
   DEFAULT_CLINIC 
 } from '../lib/supabase';
 import { useAuth } from './AuthContext';
+import { checkDuplicatePatient, findExistingDuplicateClusters } from '../utils/duplicateDetection';
 
 interface PatientContextType {
   patients: Patient[];
@@ -32,6 +44,10 @@ interface PatientContextType {
   setSearchQuery: (query: string) => void;
   clearNotification: () => void;
   showNotification: (message: string, type?: 'success' | 'error' | 'info') => void;
+
+  // Duplicate Prevention & Screening
+  checkDuplicates: (candidate: Partial<Patient>) => DuplicateCheckResult;
+  scanExistingDuplicates: () => DuplicateCluster[];
 
   // Patient CRUD
   createPatient: (patient: Omit<Patient, 'id' | 'created_at' | 'updated_at'>) => Promise<Patient>;
@@ -58,7 +74,7 @@ interface PatientContextType {
 const PatientContext = createContext<PatientContextType | undefined>(undefined);
 
 export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { doctor } = useAuth();
+  const { doctor, staffProfile, isAuthenticated } = useAuth();
   
   // Storage keys
   const PATIENTS_STORAGE_KEY = 'medrecords_patients_v1';
@@ -163,27 +179,41 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
     setAuditLogs((prev) => [newLog, ...prev]);
 
-    // Send to Supabase if connected
-    const supabase = getSupabase();
-    if (supabase) {
-      supabase.from('audit_logs').insert({
-        user_id: doctor?.id,
-        user_name: doctor?.full_name || 'Dr. Fausto Tancongco',
-        action,
-        table_name: tableName,
-        record_id: recordId,
-        metadata,
-      }).then(({ error }) => {
-        if (error) console.warn('Supabase audit log insert note:', error.message);
-      });
+    // Send to Supabase via hardened RPC function ONLY for permitted client events.
+    // Database triggers handle table mutations (INSERT/UPDATE/DELETE/ARCHIVE) authoritatively.
+    const CLIENT_AUDIT_EVENTS: AuditLog['action'][] = [
+      'LOGIN',
+      'LOGOUT',
+      'PRINT_EXPORT',
+      'DRAWING_SAVED',
+      'PASSWORD_RESET_REQUESTED',
+      'PASSWORD_UPDATED',
+    ];
+
+    if (CLIENT_AUDIT_EVENTS.includes(action)) {
+      const supabase = getSupabase();
+      if (supabase) {
+        supabase
+          .rpc('record_audit_event', {
+            p_action: action,
+            p_table_name: tableName,
+            p_record_id: recordId,
+            p_metadata: metadata,
+          })
+          .then(({ error }) => {
+            if (error) {
+              console.warn('Audit log RPC event notice:', error.message);
+            }
+          });
+      }
     }
   }, [doctor]);
 
-  // Attempt to sync from Supabase if connected
+  // Attempt to sync from Supabase if connected and authenticated
   useEffect(() => {
     const fetchSupabaseData = async () => {
       const supabase = getSupabase();
-      if (!supabase) return;
+      if (!supabase || !isAuthenticated) return;
 
       try {
         setIsLoadingData(true);
@@ -210,7 +240,121 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
 
     fetchSupabaseData();
-  }, []);
+  }, [isAuthenticated]);
+
+  // Realtime Subscription A: Patients (INSERT and UPDATE only)
+  // Ensures patient list and active patient details update without manual refresh
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    const channel = subscribeToPatientsChannel(async ({ new: newRecord }) => {
+      if (!newRecord?.id) return;
+
+      // Authorized row refetch: RLS enforces organization boundary check automatically
+      const { data: verifiedPatient, error } = await supabase
+        .from('patients')
+        .select('*')
+        .eq('id', newRecord.id)
+        .maybeSingle();
+
+      if (error || !verifiedPatient) return;
+
+      setPatients((prev) => {
+        const idx = prev.findIndex((p) => p.id === verifiedPatient.id);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = verifiedPatient;
+          return updated;
+        }
+        return [verifiedPatient, ...prev];
+      });
+
+      setSelectedPatient((prev) => (prev && prev.id === verifiedPatient.id ? verifiedPatient : prev));
+    });
+
+    return () => {
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [isAuthenticated]);
+
+  // Realtime Subscription B & C: Medical Records and Clinical Drawings
+  // Strictly scoped to the currently selected patient (INSERT and UPDATE only)
+  // Cleans up when selectedPatient changes, user logs out, or component unmounts
+  useEffect(() => {
+    if (!isAuthenticated || !selectedPatient?.id) return;
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    const patientId = selectedPatient.id;
+    const channel = subscribeToPatientClinicalChannel(
+      patientId,
+      // onRecordChange:
+      async ({ new: newRec }) => {
+        if (!newRec?.id) return;
+        // Authorized row refetch: RLS enforces can_access_patient & clinical role
+        const { data: verifiedRecord, error } = await supabase
+          .from('medical_records')
+          .select('*, clinical_drawings(*)')
+          .eq('id', newRec.id)
+          .maybeSingle();
+
+        if (error || !verifiedRecord) return;
+
+        const formattedRecord: MedicalRecord = {
+          ...verifiedRecord,
+          drawings: verifiedRecord.clinical_drawings || [],
+        };
+
+        setMedicalRecords((prev) => {
+          const idx = prev.findIndex((r) => r.id === formattedRecord.id);
+          if (idx >= 0) {
+            const updated = [...prev];
+            updated[idx] = formattedRecord;
+            return updated;
+          }
+          return [formattedRecord, ...prev];
+        });
+
+        setActiveRecord((prev) => (prev && prev.id === formattedRecord.id ? formattedRecord : prev));
+      },
+      // onDrawingChange:
+      async ({ new: newDraw }) => {
+        if (!newDraw?.id) return;
+        // Authorized row refetch: RLS enforces can_access_patient
+        const { data: verifiedDrawing, error } = await supabase
+          .from('clinical_drawings')
+          .select('*')
+          .eq('id', newDraw.id)
+          .maybeSingle();
+
+        if (error || !verifiedDrawing) return;
+
+        setMedicalRecords((prev) =>
+          prev.map((rec) => {
+            if (rec.id === verifiedDrawing.medical_record_id || rec.patient_id === verifiedDrawing.patient_id) {
+              const existingDrawings = rec.drawings || [];
+              const dIdx = existingDrawings.findIndex((d) => d.id === verifiedDrawing.id);
+              const nextDrawings = dIdx >= 0
+                ? existingDrawings.map((d) => (d.id === verifiedDrawing.id ? verifiedDrawing : d))
+                : [...existingDrawings, verifiedDrawing];
+              return { ...rec, drawings: nextDrawings };
+            }
+            return rec;
+          })
+        );
+      }
+    );
+
+    return () => {
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [isAuthenticated, selectedPatient?.id]);
 
   // Filter medical records for a specific patient
   const getPatientRecords = useCallback((patientId: string): MedicalRecord[] => {
@@ -219,12 +363,33 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
       .sort((a, b) => new Date(b.record_date).getTime() - new Date(a.record_date).getTime());
   }, [medicalRecords]);
 
+  // Duplicate screening helpers
+  const checkDuplicates = useCallback((candidate: Partial<Patient>): DuplicateCheckResult => {
+    return checkDuplicatePatient(candidate, patients, staffProfile?.organization_id);
+  }, [patients, staffProfile?.organization_id]);
+
+  const scanExistingDuplicates = useCallback((): DuplicateCluster[] => {
+    return findExistingDuplicateClusters(patients, staffProfile?.organization_id);
+  }, [patients, staffProfile?.organization_id]);
+
   // Create Patient
   const createPatient = async (data: Omit<Patient, 'id' | 'created_at' | 'updated_at'>): Promise<Patient> => {
+    // 1. Client-side authoritative screening (organization-scoped)
+    const dupCheck = checkDuplicates(data);
+    if (dupCheck.hasStrongDuplicate) {
+      const match = dupCheck.strongMatches[0];
+      const err: any = new Error(
+        `DUPLICATE_PATIENT: A patient with the same demographic details (${match.patient.name}, ${match.patient.patient_number}) already exists.`
+      );
+      err.code = 'DUPLICATE_PATIENT';
+      err.duplicate = match;
+      throw err;
+    }
+
     const nextNum = (patients.length + 171).toString().padStart(5, '0');
     const patientNumber = data.patient_number || `P-${nextNum}`;
 
-    const newPatient: Patient = {
+    let newPatient: Patient = {
       ...data,
       id: `pat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       patient_number: patientNumber,
@@ -232,36 +397,86 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       created_by: doctor?.id,
+      organization_id: staffProfile?.organization_id || undefined,
     };
 
-    // Try Supabase insert
+    // 2. Database enforcement: call atomic RPC register_patient_safe
     const supabase = getSupabase();
     if (supabase) {
       try {
-        const { data: inserted, error } = await supabase
-          .from('patients')
-          .insert({
-            patient_number: newPatient.patient_number,
-            name: newPatient.name,
-            age: newPatient.age,
-            sex: newPatient.sex,
-            status: newPatient.status,
-            religion: newPatient.religion,
-            phone: newPatient.phone,
-            address: newPatient.address,
-            personal_history: newPatient.personal_history,
-            family_history: newPatient.family_history,
-            past_medical_history: newPatient.past_medical_history,
-            created_by: doctor?.id,
-          })
-          .select()
-          .single();
+        const { data: rpcRes, error: rpcErr } = await supabase.rpc('register_patient_safe', {
+          p_patient_number: data.patient_number ? data.patient_number.trim() : null,
+          p_name: data.name.trim(),
+          p_age: data.age !== undefined && data.age !== null ? Number(data.age) : null,
+          p_date_of_birth: data.date_of_birth ? data.date_of_birth.trim() : null,
+          p_sex: data.sex || 'F',
+          p_status: data.status || 'Single',
+          p_religion: data.religion || 'RC',
+          p_phone: data.phone ? data.phone.trim() : null,
+          p_email: data.email ? data.email.trim() : null,
+          p_address: data.address ? data.address.trim() : null,
+          p_personal_history: data.personal_history || null,
+          p_family_history: data.family_history || null,
+          p_past_medical_history: data.past_medical_history || null,
+        });
 
-        if (!error && inserted) {
-          newPatient.id = inserted.id;
+        if (rpcRes) {
+          if (rpcRes.code === 'DUPLICATE_PATIENT' || rpcRes.success === false) {
+            const err: any = new Error(rpcRes.message || 'Duplicate patient detected.');
+            err.code = 'DUPLICATE_PATIENT';
+            err.duplicate = {
+              patient: {
+                id: rpcRes.existing_patient_id,
+                patient_number: rpcRes.patient_number,
+                name: rpcRes.name,
+              },
+              matchType: 'STRONG_DEMOGRAPHICS',
+              confidence: 'strong',
+              reason: rpcRes.message || 'A patient with the same name and demographic details already exists in this clinic.',
+            };
+            throw err;
+          }
+
+          if (rpcRes.success && rpcRes.patient) {
+            newPatient = {
+              ...newPatient,
+              ...rpcRes.patient,
+            };
+          }
+        } else if (rpcErr) {
+          // If RPC is not available or throws, fall back to standard insert with duplicate protection already verified
+          console.warn('register_patient_safe RPC fallback notice:', rpcErr);
+          const { data: inserted, error: insertError } = await supabase
+            .from('patients')
+            .insert({
+              patient_number: newPatient.patient_number,
+              name: newPatient.name,
+              age: newPatient.age,
+              date_of_birth: newPatient.date_of_birth || null,
+              sex: newPatient.sex,
+              status: newPatient.status,
+              religion: newPatient.religion,
+              phone: newPatient.phone,
+              email: newPatient.email || null,
+              address: newPatient.address,
+              personal_history: newPatient.personal_history,
+              family_history: newPatient.family_history,
+              past_medical_history: newPatient.past_medical_history,
+              created_by: doctor?.id,
+              organization_id: staffProfile?.organization_id || undefined,
+            })
+            .select()
+            .single();
+
+          if (!insertError && inserted) {
+            newPatient.id = inserted.id;
+          }
         }
-      } catch (err) {
-        console.warn('Supabase insert fallback:', err);
+      } catch (err: any) {
+        if (err.code === 'DUPLICATE_PATIENT') {
+          throw err;
+        }
+        console.warn('Supabase patient insert error notice:', err);
       }
     }
 
@@ -271,7 +486,7 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
       name: newPatient.name,
       patient_number: newPatient.patient_number,
     });
-    showNotification(`Patient "${newPatient.name}" created successfully.`, 'success');
+    showNotification(`Patient "${newPatient.name}" registered successfully.`, 'success');
     return newPatient;
   };
 
@@ -607,6 +822,8 @@ export const PatientProvider: React.FC<{ children: React.ReactNode }> = ({ child
         setSearchQuery,
         clearNotification,
         showNotification,
+        checkDuplicates,
+        scanExistingDuplicates,
         createPatient,
         updatePatient,
         archivePatient,
